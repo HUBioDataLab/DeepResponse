@@ -150,8 +150,6 @@ class DrugStratifiedDatasetStrategy(BaseDatasetStrategy):
                 f"Dataset too small after filtering: {len(filtered_df)} samples"
             )
 
-        # Create disjoint identity splits for proper generalization testing
-        # Each molecular identity appears in only one split (train, val, or test)
         unique_identities = filtered_df["drug_identity"].unique()
         rng = np.random.default_rng(random_state)
         shuffled_identities = rng.permutation(unique_identities)
