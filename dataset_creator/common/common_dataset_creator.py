@@ -292,7 +292,6 @@ class BaseDatasetCreator(ABC):
         """Filter array features to the cancer gene census list using gene_axis."""
         gene_set = self.load_gene_name_set()
         keep_mask = [gene in gene_set for gene in gene_axis]
-        kept = sum(keep_mask)
         filtered_df = cell_line_features_df.copy()
         filtered_df["cell_line_features"] = filtered_df["cell_line_features"].apply(
             lambda arr: (
