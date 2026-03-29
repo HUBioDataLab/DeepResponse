@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 from typing import Any
 
@@ -338,4 +339,4 @@ def _validate_parsed_args(parser: ArgumentParser, args: argparse.Namespace) -> N
             "drug_stratified and drug_cell_stratified."
         )
 
-    print(f"✓ Argument validation passed on {args.data_source} data")
+    logging.info("Argument validation passed on %s data", args.data_source)
