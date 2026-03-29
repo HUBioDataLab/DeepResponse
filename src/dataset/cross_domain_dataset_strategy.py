@@ -1,5 +1,7 @@
 """Cross-domain dataset strategy."""
 
+from __future__ import annotations
+
 import logging
 from typing import Any, Dict, Iterator, Optional, Tuple
 

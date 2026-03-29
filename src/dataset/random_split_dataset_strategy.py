@@ -1,5 +1,7 @@
 """Random split dataset strategy."""
 
+from __future__ import annotations
+
 import logging
 from typing import Any, Dict, Iterator, Optional, Tuple
 
@@ -183,7 +185,7 @@ class RandomSplitDatasetStrategy(BaseDatasetStrategy):
             x_val,
             x_test,
         )
-        logging.info(
+        logging.debug(
             "Ranking metadata (random split fold %d/%d): unique_cells=%d, train_pairs=%d",
             int(fold_idx or 1),
             int(n_folds or 1),

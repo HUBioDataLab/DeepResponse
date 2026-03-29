@@ -1,5 +1,7 @@
 """Drug stratified dataset strategy."""
 
+from __future__ import annotations
+
 import logging
 from typing import Any, Dict, Iterator, Optional, Tuple
 
@@ -289,7 +291,7 @@ class DrugStratifiedDatasetStrategy(BaseDatasetStrategy):
             test_identity_count = int(test_df["drug_identity"].nunique())
             self._validate_r2_prerequisites(y_train, y_val, y_test)
 
-            logging.info(
+            logging.debug(
                 "Fold %d/%d split summary - samples: Train=%d, Val=%d, Test=%d | identities: Train=%d, Val=%d, Test=%d",
                 fold_idx,
                 n_folds,
@@ -349,7 +351,7 @@ class DrugStratifiedDatasetStrategy(BaseDatasetStrategy):
                 x_val,
                 x_test,
             )
-            logging.info(
+            logging.debug(
                 "Ranking metadata (drug-stratified fold %d/%d): unique_cells=%d, train_pairs=%d",
                 fold_idx,
                 n_folds,
