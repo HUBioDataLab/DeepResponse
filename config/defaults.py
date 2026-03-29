@@ -6,20 +6,16 @@ from typing import Optional
 
 @dataclass(frozen=True)
 class DefaultConfig:
-    # --- 1) Project and Runtime ---
     use_comet: bool = True
     use_amp: bool = True
     random_state: int = 42
     epochs: int = 100
 
-    # --- 2) Data and Split ---
     data_source: str = "depmap"
     evaluation_source: Optional[str] = None
     split_type: str = "random"
     n_splits: int = 5
 
-    # --- 3) Model Architecture ---
-    # Baseline uses full encoder fine-tuning from step 0.
     trainable_encoder_layers: int = 12
     encoder_pooling: str = "mean"
     cell_embed_dim: int = 256
@@ -34,9 +30,13 @@ class DefaultConfig:
     modality_dropout_schedule: str = "warmup_decay"
     modality_dropout_final_scale: float = 0.25
     bounded_output: str = "none"
+    bounded_output_mode: str = "train_stats_fixed"
+    bounded_output_center: float = 0.0
+    bounded_output_scale: float = 10.0
     bounded_output_tau: float = 1.0
+    bounded_output_std_factor: float = 3.0
+    bounded_output_min_scale: float = 1.0
 
-    # --- 4) Training and Optimization ---
     batch_size: int = 64
     learning_rate: float = 5e-5
     weight_decay: float = 1e-3
@@ -49,9 +49,6 @@ class DefaultConfig:
     residual_target: bool = False
     ranking_group_mode: str = "auto"
 
-    # --- 5) Fine-Tuning ---
-    # -1 disables staged unfreezing; with trainable_encoder_layers=12 this means
-    # all configured layers are trainable from the beginning.
     unfreeze_epoch: int = -1
     unfreeze_layers: int = 12
     unfreeze_lr_factor: float = 0.1
