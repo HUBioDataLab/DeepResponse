@@ -26,6 +26,8 @@ from config.constants import (
     COSINE_ETA_MIN_SCALE,
     DIR_CHECKPOINTS,
     DIR_LOGS,
+    EARLY_STOP_MIN_DELTA,
+    GRAD_CLIP_NORM,
     ONECYCLE_FINAL_DIV_FACTOR,
     ONECYCLE_PCT_START,
     SAMPLE_WEIGHT_EPS,
@@ -47,6 +49,7 @@ def pairwise_ranking_loss(
     group_ids: torch.Tensor,
     temperature: float = 1.0,
     margin: float = 1e-6,
+    max_ranking_samples: int = 128,
 ) -> tuple[torch.Tensor, int]:
     """Pairwise ranking loss within the same group."""
     y_true = y_true.reshape(-1)
@@ -55,6 +58,13 @@ def pairwise_ranking_loss(
     n_items = y_true.shape[0]
     if n_items < 2:
         return torch.tensor(0.0, device=y_true.device), 0
+
+    if n_items > max_ranking_samples:
+        idx = torch.randperm(n_items, device=y_true.device)[:max_ranking_samples]
+        y_true = y_true[idx]
+        y_pred = y_pred[idx]
+        group_ids = group_ids[idx]
+        n_items = max_ranking_samples
 
     diff_true = y_true.unsqueeze(1) - y_true.unsqueeze(0)
     diff_pred = y_pred.unsqueeze(1) - y_pred.unsqueeze(0)
@@ -125,7 +135,7 @@ class BestValidationState:
 
 
 class BaseTrainingStrategy(ABC):
-    """Abstract base class for training strategies with shared infrastructure."""
+    """Abstract base class for training strategies."""
 
     onecycle_div_factor: float
 
@@ -306,7 +316,7 @@ class BaseTrainingStrategy(ABC):
         early_stopping: EarlyStopping,
         monitor_metric: str,
     ) -> None:
-        """Log early stopping summary with configured monitor metric."""
+        """Log early stopping event."""
         logging.info(
             "Early stopping at epoch %d (best epoch=%d, best %s=%.4f)",
             epoch,
@@ -338,7 +348,7 @@ class BaseTrainingStrategy(ABC):
         test_metrics: dict,
         train_summary: dict[str, float | str],
     ) -> None:
-        """Attach best-validation fields from train summary into test metrics."""
+        """Attach best-validation fields into test metrics."""
         keys = (
             "best_val_loss",
             "best_val_pcc",
@@ -375,7 +385,7 @@ class BaseTrainingStrategy(ABC):
         model: nn.Module,
         grad_clip_norm: float,
     ) -> bool:
-        """Run backward + optimizer step and report whether params were updated."""
+        """Run backward + optimizer step."""
         if scaler.is_enabled():
             prev_scale = scaler.get_scale()
             scaler.scale(loss).backward()
@@ -430,7 +440,7 @@ class BaseTrainingStrategy(ABC):
 
         drug_encoder = getattr(model, "drug_encoder", None)
         if drug_encoder is None or not hasattr(drug_encoder, "_configure_trainable_layers"):
-            logging.warning("Staged unfreeze requested but model.drug_encoder does not expose _configure_trainable_layers")
+            logging.warning("Staged unfreeze requested but drug_encoder missing _configure_trainable_layers")
             return
 
         try:
@@ -443,7 +453,17 @@ class BaseTrainingStrategy(ABC):
             ]
             if new_params:
                 base_lr = optimizer.param_groups[0]["lr"]
-                optimizer.add_param_group({"params": new_params, "lr": base_lr})
+                new_group = {"params": new_params, "lr": base_lr}
+                for key in (
+                    "initial_lr",
+                    "max_lr",
+                    "min_lr",
+                    "max_momentum",
+                    "base_momentum",
+                ):
+                    if key in optimizer.param_groups[0]:
+                        new_group[key] = optimizer.param_groups[0][key]
+                optimizer.add_param_group(new_group)
                 BaseTrainingStrategy._sync_scheduler_lr_lists(scheduler, optimizer)
                 logging.info("Added %d newly unfrozen params to optimizer", len(new_params))
 
@@ -551,7 +571,7 @@ class BaseTrainingStrategy(ABC):
         logging.info("Bounded output configured: mode=%s center=%.4f scale=%.4f tau=%.4f", bounded_output_mode, center, scale, tau)
 
     def _create_optimizer(self, model: nn.Module, lr: float, weight_decay: float) -> optim.Optimizer:
-        """Create AdamW optimizer, skipping frozen params to save VRAM."""
+        """Create AdamW optimizer, skipping frozen params."""
         encoder_params = []
         head_params = []
         for name, param in model.named_parameters():
@@ -574,7 +594,7 @@ class BaseTrainingStrategy(ABC):
             logging.info("Scheduler selected: CosineAnnealingLR (epoch-step, stl=0)")
             scheduler = CosineAnnealingLR(
                 optimizer,
-                T_max=strategy_creator.epoch,
+                T_max=strategy_creator.epochs,
                 eta_min=max(
                     strategy_creator.learning_rate * COSINE_ETA_MIN_SCALE,
                     COSINE_ETA_MIN_FLOOR,
@@ -583,7 +603,7 @@ class BaseTrainingStrategy(ABC):
             return scheduler, "epoch"
 
         logging.info("Scheduler selected: OneCycleLR (batch-step, stl>0)")
-        total_steps = max(1, strategy_creator.epoch * max(1, steps_per_epoch))
+        total_steps = max(1, strategy_creator.epochs * max(1, steps_per_epoch))
         scheduler = OneCycleLR(
             optimizer,
             max_lr=[group["lr"] for group in optimizer.param_groups],
@@ -610,7 +630,7 @@ class BaseTrainingStrategy(ABC):
 
     def _batch_targets(self, batch) -> torch.Tensor:
         """Extract response targets from a batch."""
-        return batch["response"].to(self.device).unsqueeze(-1)
+        return batch["response"].to(self.device).reshape(-1, 1)
 
     @staticmethod
     def _tensor_to_numpy(tensor: torch.Tensor) -> np.ndarray:
@@ -790,3 +810,230 @@ class BaseTrainingStrategy(ABC):
             logging.info("%s: %.4f ± %.4f", key, cv_mean[key], cv_std[key])
             if comet_logger:
                 comet_logger.log_metrics({f"cv_mean_{key}": cv_mean[key], f"cv_std_{key}": cv_std[key]})
+
+    def _run_training_loop(
+        self,
+        *,
+        model: nn.Module,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        optimizer: optim.Optimizer,
+        scheduler,
+        scheduler_mode: str,
+        n_epochs: int,
+        checkpoint_path: str,
+        fold_idx: int,
+        comet_logger,
+        use_amp: bool,
+        patience: int,
+        checkpoint_metric: str,
+        bounded_output: str,
+        bounded_output_mode: str,
+        bounded_output_center: float,
+        bounded_output_scale: float,
+        bounded_output_tau: float,
+        bounded_output_std_factor: float,
+        bounded_output_min_scale: float,
+        use_ranking: bool,
+        ranking_weight: float,
+        ranking_group_mode: str,
+        split_type: str,
+        unfreeze_epoch: int,
+        unfreeze_layers: int,
+        unfreeze_lr_factor: float,
+    ) -> dict[str, float | str]:
+        """Shared training loop used by all training strategies."""
+        criterion_train = nn.SmoothL1Loss(reduction="none")
+        criterion_eval = nn.SmoothL1Loss()
+        monitor_metric, monitor_mode, early_stopping, best_state = (
+            self._build_checkpoint_policy(
+                checkpoint_metric=checkpoint_metric,
+                patience=patience,
+                min_delta=EARLY_STOP_MIN_DELTA,
+            )
+        )
+        effective_group_mode = self._resolve_ranking_group_mode(
+            split_type=split_type,
+            ranking_group_mode=ranking_group_mode,
+        )
+        logging.info(
+            "Checkpoint/Early-stop policy: monitor=%s mode=%s",
+            monitor_metric,
+            monitor_mode,
+        )
+
+        self._configure_bounded_output(
+            model=model,
+            train_loader=train_loader,
+            bounded_output=bounded_output,
+            bounded_output_mode=bounded_output_mode,
+            bounded_output_center=bounded_output_center,
+            bounded_output_scale=bounded_output_scale,
+            bounded_output_tau=bounded_output_tau,
+            bounded_output_std_factor=bounded_output_std_factor,
+            bounded_output_min_scale=bounded_output_min_scale,
+        )
+
+        if use_ranking:
+            logging.info(
+                "Ranking regularization: ENABLED (weight=%.4f, group_mode=%s, split=%s)",
+                ranking_weight,
+                effective_group_mode,
+                split_type,
+            )
+        else:
+            logging.info(
+                "Ranking regularization: DISABLED (split=%s)",
+                split_type,
+            )
+
+        amp_enabled = bool(use_amp and self.device == "cuda")
+        amp_device = "cuda" if self.device == "cuda" else "cpu"
+        scaler = torch.amp.GradScaler(amp_device, enabled=amp_enabled)
+
+        for epoch in range(1, n_epochs + 1):
+            if hasattr(model, "set_training_progress"):
+                model.set_training_progress(epoch=epoch, total_epochs=n_epochs)
+            self._staged_unfreeze(
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch,
+                unfreeze_epoch=unfreeze_epoch,
+                unfreeze_layers=unfreeze_layers,
+                unfreeze_lr_factor=unfreeze_lr_factor,
+            )
+            start_time = time.time()
+            model.train()
+
+            train_loss_total = 0.0
+            huber_total = 0.0
+            rank_total = 0.0
+            n_batches = 0
+            train_preds_list: list[np.ndarray] = []
+            train_targets_list: list[np.ndarray] = []
+
+            for batch in train_loader:
+                targets = self._batch_targets(batch)
+                smiles = batch["smiles"]
+                sample_weight = self._resolve_sample_weight(batch)
+
+                group_ids = self._resolve_group_ids(batch)
+                rank_group_ids = self._resolve_batch_group_ids(
+                    split_type=split_type,
+                    ranking_group_mode=effective_group_mode,
+                    smiles=smiles,
+                    group_ids=group_ids,
+                )
+
+                optimizer.zero_grad(set_to_none=True)
+                with torch.amp.autocast(amp_device, enabled=amp_enabled):
+                    predictions = self._forward_batch(model, batch)
+                    huber_loss = self._compute_weighted_huber(
+                        criterion_train,
+                        predictions,
+                        targets,
+                        sample_weight,
+                    )
+
+                    rank_loss = torch.tensor(0.0, device=self.device)
+                    if use_ranking and rank_group_ids is not None:
+                        rank_loss, _ = pairwise_ranking_loss(
+                            targets.squeeze(-1),
+                            predictions.squeeze(-1),
+                            rank_group_ids,
+                        )
+
+                    loss = huber_loss + (ranking_weight * rank_loss)
+
+                optimizer_stepped = self._optimizer_step(
+                    loss=loss,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    model=model,
+                    grad_clip_norm=GRAD_CLIP_NORM,
+                )
+
+                if scheduler_mode == "batch" and optimizer_stepped:
+                    scheduler.step()
+
+                train_loss_total += float(loss.item())
+                huber_total += float(huber_loss.item())
+                rank_total += float(rank_loss.item())
+                n_batches += 1
+                train_preds_list.append(self._tensor_to_numpy(predictions))
+                train_targets_list.append(self._tensor_to_numpy(targets))
+
+            train_loss = train_loss_total / max(1, n_batches)
+            train_huber = huber_total / max(1, n_batches)
+            train_rank = rank_total / max(1, n_batches)
+
+            train_metrics, train_mse = self._compute_train_epoch_metrics(
+                train_preds_list=train_preds_list,
+                train_targets_list=train_targets_list,
+            )
+
+            val_loss, val_metrics = self._evaluate(model, val_loader, criterion_eval)
+
+            if scheduler_mode == "epoch":
+                scheduler.step()
+
+            elapsed = time.time() - start_time
+            current_lr = max(group.get("lr", 0.0) for group in optimizer.param_groups)
+            val_mse = float(val_metrics.get("mse", float("nan")))
+            logging.info(
+                "[Fold %d | Epoch %d/%d] Time: %.1fs | LR: %.2e | "
+                "Train {Loss: %.4f, MSE: %.4f, R2: %.4f, PCC: %.4f} | "
+                "Val {Loss: %.4f, MSE: %.4f, R2: %.4f, PCC: %.4f}",
+                fold_idx,
+                epoch,
+                n_epochs,
+                elapsed,
+                current_lr,
+                train_loss,
+                train_mse,
+                train_metrics["r2"],
+                train_metrics["pcc"],
+                val_loss,
+                val_mse,
+                val_metrics["r2"],
+                val_metrics["pcc"],
+            )
+
+            if comet_logger:
+                prefix = f"fold_{fold_idx}"
+                metrics_payload = {
+                    f"{prefix}/train_loss": train_loss,
+                    f"{prefix}/train_mse": train_mse,
+                    f"{prefix}/train_huber": train_huber,
+                    f"{prefix}/train_r2": train_metrics["r2"],
+                    f"{prefix}/train_pcc": train_metrics["pcc"],
+                    f"{prefix}/val_loss": val_loss,
+                    f"{prefix}/val_mse": val_mse,
+                    f"{prefix}/val_r2": val_metrics["r2"],
+                    f"{prefix}/val_pcc": val_metrics["pcc"],
+                    f"{prefix}/lr": current_lr,
+                }
+                if use_ranking:
+                    metrics_payload[f"{prefix}/train_rank"] = train_rank
+                comet_logger.log_metrics(metrics_payload, epoch=epoch)
+
+            monitor_score, improved = self._update_best_checkpoint(
+                monitor_metric=monitor_metric,
+                monitor_mode=monitor_mode,
+                val_loss=float(val_loss),
+                val_metrics=val_metrics,
+                best_state=best_state,
+                epoch=epoch,
+                model=model,
+                optimizer=optimizer,
+                checkpoint_path=checkpoint_path,
+            )
+            if improved:
+                self._log_best_model_saved(monitor_metric, best_state)
+
+            if early_stopping(monitor_score, epoch):
+                self._log_early_stopping(epoch, early_stopping, monitor_metric)
+                break
+
+        return self._best_state_to_summary(monitor_metric, best_state)
