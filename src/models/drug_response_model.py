@@ -130,11 +130,19 @@ class DrugResponseModel(nn.Module):
 
         drug_keep_prob = max(1e-6, 1.0 - p_drug)
         cell_keep_prob = max(1e-6, 1.0 - p_cell)
-        drug_scale = 1.0 / drug_keep_prob
-        cell_scale = 1.0 / cell_keep_prob
+
+        dropped_cell = ~keep_cell.bool()
+        dropped_drug = ~keep_drug.bool()
+
+        drug_scale = torch.ones(batch_size, device=drug_emb.device, dtype=drug_emb.dtype)
+        cell_scale = torch.ones(batch_size, device=cell_emb.device, dtype=cell_emb.dtype)
+        drug_scale[dropped_cell & keep_drug.bool()] = 1.0 / drug_keep_prob
+        cell_scale[dropped_drug & keep_cell.bool()] = 1.0 / cell_keep_prob
 
         keep_drug = keep_drug.to(drug_emb.dtype).unsqueeze(-1)
         keep_cell = keep_cell.to(cell_emb.dtype).unsqueeze(-1)
+        drug_scale = drug_scale.unsqueeze(-1)
+        cell_scale = cell_scale.unsqueeze(-1)
 
         dropped_drug = drug_emb * keep_drug * drug_scale
         dropped_cell = cell_emb * keep_cell * cell_scale
