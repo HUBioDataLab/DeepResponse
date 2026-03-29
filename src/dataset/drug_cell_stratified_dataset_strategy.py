@@ -1,5 +1,7 @@
 """Drug-cell stratified dataset strategy."""
 
+from __future__ import annotations
+
 import logging
 from typing import Any, Dict, Iterator, Optional, Set, Tuple
 
@@ -234,7 +236,7 @@ class DrugCellStratifiedDatasetStrategy(BaseDatasetStrategy):
             random_state,
         )
 
-        logging.info(
+        logging.debug(
             "Selected strict test holdout fraction %.3f -> strict test rows=%d, disjoint train/val pool=%d, total used=%d/%d",
             best["frac"],
             best["test_rows"],
@@ -302,7 +304,7 @@ class DrugCellStratifiedDatasetStrategy(BaseDatasetStrategy):
         val_pct = len(x_val) / total_samples * 100
         test_pct = len(x_test) / total_samples * 100
 
-        logging.info(
+        logging.debug(
             "Achieved ratios: Train=%.1f%%, Validation=%.1f%%, Test=%.1f%%",
             train_pct,
             val_pct,
@@ -408,7 +410,7 @@ class DrugCellStratifiedDatasetStrategy(BaseDatasetStrategy):
             train_pct = len(x_train) / total_samples * 100.0
             val_pct = len(x_val) / total_samples * 100.0
             test_pct = len(x_test) / total_samples * 100.0
-            logging.info(
+            logging.debug(
                 "Fold %d/%d split sizes: Train=%d, Val=%d, Test=%d",
                 fold_idx,
                 n_folds,
@@ -416,7 +418,7 @@ class DrugCellStratifiedDatasetStrategy(BaseDatasetStrategy):
                 len(x_val),
                 len(x_test),
             )
-            logging.info(
+            logging.debug(
                 "Fold %d/%d achieved ratios: Train=%.1f%%, Val=%.1f%%, Test=%.1f%%",
                 fold_idx,
                 n_folds,
@@ -478,8 +480,8 @@ class DrugCellStratifiedDatasetStrategy(BaseDatasetStrategy):
         if train_pairs & val_pairs:
             raise ValueError("Pair leakage detected between train and validation sets.")
 
-        logging.info("Stratification validation passed.")
-        logging.info(
+        logging.debug("Stratification validation passed.")
+        logging.debug(
             "Strict test disjointness: held-out drug identities=%d, held-out cells=%d, strict test rows=%d",
             len(test_drug_identities),
             len(test_cells),

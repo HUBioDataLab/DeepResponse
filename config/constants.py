@@ -5,7 +5,6 @@ from typing import Set
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 
-# --- 1. Argument Validations & Allowed Choices ---
 DATA_SOURCES: Set[str] = {"depmap", "gdsc", "ccle"}
 SPLIT_TYPES: Set[str] = {
     "random",
@@ -43,7 +42,6 @@ RANKING_GROUP_MODES: Set[str] = {
 }
 ALLOWED_CHECKPOINT_METRICS: Set[str] = {"auto", "val_loss", "val_r2"}
 
-# --- 1b. Internal Fixed Defaults  ---
 DEFAULT_BOUNDED_OUTPUT_MODE: str = "train_stats_fixed"
 DEFAULT_BOUNDED_OUTPUT_CENTER: float = 0.0
 DEFAULT_BOUNDED_OUTPUT_SCALE: float = 10.0
@@ -52,15 +50,13 @@ DEFAULT_BOUNDED_OUTPUT_MIN_SCALE: float = 1.0
 DEFAULT_LAYERWISE_LR_DECAY: float = 1.0
 DEFAULT_LAYERWISE_LR_MIN_SCALE: float = 1.0
 
-# --- 2. Dataset Split Defaults ---
 BINARY_THRESHOLD: float = 6.0
 TEST_SPLIT_RATIO: float = 0.10
 VALIDATION_SPLIT_RATIO: float = 0.10
 DEFAULT_NUM_WORKERS: int = 4
 
-# --- 3. Training & Optimization ---
 GRAD_CLIP_NORM: float = 1.0
-EARLY_STOP_MIN_DELTA: float = 1e-5
+EARLY_STOP_MIN_DELTA: float = 1e-4
 SAMPLE_WEIGHT_EPS: float = 1e-8
 COSINE_ETA_MIN_SCALE: float = 0.01
 COSINE_ETA_MIN_FLOOR: float = 1e-7
@@ -71,7 +67,6 @@ ONECYCLE_DIV_FACTOR_STRATIFIED: float = 100.0
 CACHE_EMBEDDING_BATCH_MIN: int = 16
 CACHE_EMBEDDING_BATCH_MAX: int = 256
 
-# --- 4. Paths & Artifacts ---
 DIR_LOGS: str = "logs"
 DIR_CHECKPOINTS: str = "checkpoints"
 DIR_PRETRAINED_SELFORMER: Path = PROJECT_ROOT / "pretrained" / "selformer"

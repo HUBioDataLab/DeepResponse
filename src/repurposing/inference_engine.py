@@ -28,7 +28,7 @@ _MAPPING_CSV_PATH = PROJECT_ROOT / "dataset_creator" / "common" / "curation" / "
 
 def _stable_synthetic_drug_id(smiles: str) -> int:
     """Generate a stable negative id for custom compounds."""
-    digest = hashlib.sha1(smiles.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(smiles.encode("utf-8")).hexdigest()
     return -((int(digest[:15], 16) % 2_000_000_000) + 1)
 
 

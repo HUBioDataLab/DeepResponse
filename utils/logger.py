@@ -149,11 +149,13 @@ def log_configuration(args: Namespace) -> None:
                 "modality_dropout_final_scale",
                 defaults.modality_dropout_final_scale,
             ),
-            "bounded_output": defaults.bounded_output,
+            "bounded_output": getattr(args, "bounded_output", defaults.bounded_output),
             "bounded_output_mode": getattr(
-                defaults, "bounded_output_mode", DEFAULT_BOUNDED_OUTPUT_MODE
+                args, "bounded_output_mode", DEFAULT_BOUNDED_OUTPUT_MODE
             ),
-            "bounded_output_tau": defaults.bounded_output_tau,
+            "bounded_output_tau": getattr(
+                args, "bounded_output_tau", defaults.bounded_output_tau
+            ),
             "ranking_weight": getattr(args, "ranking_weight", defaults.ranking_weight),
             "ranking_group_mode": getattr(
                 args, "ranking_group_mode", defaults.ranking_group_mode

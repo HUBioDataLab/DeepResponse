@@ -1,5 +1,7 @@
 """Cell stratified dataset strategy."""
 
+from __future__ import annotations
+
 import logging
 from typing import Any, Dict, Iterator, Optional, Tuple
 
@@ -158,7 +160,7 @@ class CellStratifiedDatasetStrategy(BaseDatasetStrategy):
                 test_df,
             )
 
-            logging.info(
+            logging.debug(
                 "Cell-stratified fold %d/%d sample counts - Train=%d, Validation=%d, Test=%d",
                 fold_idx,
                 n_folds,
@@ -166,7 +168,7 @@ class CellStratifiedDatasetStrategy(BaseDatasetStrategy):
                 len(x_val),
                 len(x_test),
             )
-            logging.info(
+            logging.debug(
                 "Cell-stratified fold %d/%d unique cell-line counts - Train=%d, Validation=%d, Test=%d",
                 fold_idx,
                 n_folds,
