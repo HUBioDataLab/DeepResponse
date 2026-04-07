@@ -23,11 +23,10 @@ PARALLEL_LOADER_WORKERS = 3
 
 def collate_fn(batch: list[dict[str, object]]) -> dict[str, object]:
     """Collate batch with string fields handled separately."""
-    smiles = [item.pop("smiles") for item in batch]
-    collated = default_collate(batch)
+    smiles = [item["smiles"] for item in batch]
+    items_without_smiles = [{k: v for k, v in item.items() if k != "smiles"} for item in batch]
+    collated = default_collate(items_without_smiles)
     collated["smiles"] = smiles
-    for item, s in zip(batch, smiles):
-        item["smiles"] = s
     return collated
 
 
@@ -109,6 +108,7 @@ class BaseDatasetStrategy(ABC):
         ood_weighting=True,
         residual_target=False,
         n_splits=1,
+        omics_mask: str = "1,1,1,1",
     ):
         """Initialize base dataset strategy state."""
         self.data_path = data_path
@@ -117,6 +117,10 @@ class BaseDatasetStrategy(ABC):
         self.hard_validation = hard_validation
         self.ood_weighting = ood_weighting
         self.residual_target = residual_target
+        self._fingerprint_cache: dict = {}
+        self._kgram_cache: dict = {}
+        mask_vals = [int(v) for v in omics_mask.split(",")]
+        self._omics_mask = np.array(mask_vals, dtype=np.float32).reshape(4, 1)
 
     def _select_model_inputs(self, dataset_df: pd.DataFrame) -> pd.DataFrame:
         """Select model input columns for DataLoader construction."""
@@ -315,20 +319,26 @@ class BaseDatasetStrategy(ABC):
         all_ids = sorted(set(candidate_ids) | set(reference_ids))
         fp_lookup = {}
         for identity in all_ids:
+            if identity in self._fingerprint_cache:
+                fp_lookup[identity] = self._fingerprint_cache[identity]
+                continue
             smiles = smiles_lookup.get(identity)
             if not smiles:
                 continue
             mol = Chem.MolFromSmiles(smiles)
             if mol is None:
                 continue
-            fp_lookup[identity] = AllChem.GetMorganFingerprintAsBitVect(
-                mol, radius=2, nBits=2048
-            )
+            fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048)
+            self._fingerprint_cache[identity] = fp
+            fp_lookup[identity] = fp
 
-        token_lookup = {
-            identity: self._smiles_kgram_tokens(smiles_lookup.get(identity), k=3)
-            for identity in all_ids
-        }
+        token_lookup = {}
+        for identity in all_ids:
+            if identity not in self._kgram_cache:
+                self._kgram_cache[identity] = self._smiles_kgram_tokens(
+                    smiles_lookup.get(identity), k=3
+                )
+            token_lookup[identity] = self._kgram_cache[identity]
 
         ref_fp_ids = [ref_id for ref_id in reference_ids if ref_id in fp_lookup]
         ref_fps = [fp_lookup[ref_id] for ref_id in ref_fp_ids]
@@ -640,7 +650,8 @@ class BaseDatasetStrategy(ABC):
             cell_features_lookup, cell_line_names
         ).astype(np.float32, copy=False)
 
-        valid_mask = np.isfinite(stacked)
+        channel_has_data = (stacked != 0.0).any(axis=2, keepdims=True)
+        valid_mask = np.isfinite(stacked) & channel_has_data
         valid_count = valid_mask.sum(axis=0).astype(np.float32)
 
         safe_values = np.where(valid_mask, stacked, 0.0).astype(np.float32, copy=False)
@@ -681,14 +692,17 @@ class BaseDatasetStrategy(ABC):
         mean: np.ndarray,
         std: np.ndarray,
     ) -> Union[pd.Series, Dict[str, np.ndarray]]:
+        mask = self._omics_mask
+
         def transform(arr):
             if not isinstance(arr, np.ndarray):
                 return arr
             filled = np.where(np.isfinite(arr), arr, mean).astype(np.float32)
             scaled = (filled - mean) / std
-            return np.nan_to_num(scaled, nan=0.0, posinf=0.0, neginf=0.0).astype(
+            normalized = np.nan_to_num(scaled, nan=0.0, posinf=0.0, neginf=0.0).astype(
                 np.float32
             )
+            return normalized * mask
 
         return self._map_feature_lookup(cell_features_lookup, transform)
 
@@ -730,6 +744,38 @@ class BaseDatasetStrategy(ABC):
 
     @abstractmethod
     def prepare_dataset(self, dataset_dict, split_type, batch_size, random_state): ...
+
+    def _filter_cells_by_active_mask(self, dataset_df: pd.DataFrame) -> pd.DataFrame:
+        """Drop cell lines with no signal in active omics channels for ablation only."""
+        active = [i for i, v in enumerate(self._omics_mask.flatten()) if v > 0]
+        if len(active) == 4:
+            return dataset_df
+
+        def has_signal(arr: np.ndarray) -> bool:
+            if not isinstance(arr, np.ndarray) or arr.ndim != 2:
+                return True
+            return any((arr[ch] != 0).any() for ch in active)
+
+        unique = (
+            dataset_df[["cell_line_name", "cell_line_features"]]
+            .drop_duplicates("cell_line_name")
+        )
+        signal_mask = unique["cell_line_features"].apply(has_signal)
+        valid_cells = set(unique.loc[signal_mask, "cell_line_name"])
+
+        n_cells_before = dataset_df["cell_line_name"].nunique()
+        filtered = dataset_df[dataset_df["cell_line_name"].isin(valid_cells)].reset_index(drop=True)
+        n_removed = n_cells_before - len(valid_cells)
+        if n_removed > 0:
+            logging.info(
+                "Ablation filter (active_channels=%s): removed %d cell lines with no signal "
+                "in active omics (%d -> %d rows).",
+                active,
+                n_removed,
+                len(dataset_df),
+                len(filtered),
+            )
+        return filtered
 
     def create_drug_cell_dataset(
         self, dataset_raw: pd.DataFrame
@@ -828,9 +874,12 @@ class BaseDatasetStrategy(ABC):
 
         filtered_out = input_rows - len(x_data_filtered)
         if filtered_out > 0:
+            pct = 100.0 * filtered_out / input_rows
             logging.warning(
-                "Skipped %d entries due to missing cell features or drug SMILES.",
+                "DataLoader: dropped %d/%d rows (%.1f%%) — cell/drug not in lookup",
                 filtered_out,
+                input_rows,
+                pct,
             )
         if filtered_out > 0 and not return_filtered_data and not is_training:
             logging.warning(
@@ -922,8 +971,10 @@ class BaseDatasetStrategy(ABC):
         )
         val_drug_smiles = train_drug_smiles if val_drug_smiles is None else val_drug_smiles
 
+        total_samples = len(x_train) + len(x_val) + len(x_test)
+        effective_workers = 1 if total_samples < 5000 else PARALLEL_LOADER_WORKERS
         with concurrent.futures.ThreadPoolExecutor(
-            max_workers=PARALLEL_LOADER_WORKERS
+            max_workers=effective_workers
         ) as executor:
             future_train = executor.submit(
                 self.create_data_loader,
