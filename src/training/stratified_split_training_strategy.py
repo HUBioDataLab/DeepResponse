@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import copy
+import io
 import logging
 import os
 from collections.abc import Iterable as IterableABC
@@ -11,9 +11,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from config.constants import (
-    ONECYCLE_DIV_FACTOR_STRATIFIED,
-)
 from src.evaluation import evaluate_test_metrics
 from src.models import create_model
 from src.repurposing.inference_engine import RepurposingInferenceEngine
@@ -24,8 +21,6 @@ from src.training.base_training_strategy import (
 
 class StratifiedSplitTrainingStrategy(BaseTrainingStrategy):
     """Training strategy for stratified splits."""
-
-    onecycle_div_factor = ONECYCLE_DIV_FACTOR_STRATIFIED
 
     def train_and_evaluate_model(
         self,
@@ -78,9 +73,12 @@ class StratifiedSplitTrainingStrategy(BaseTrainingStrategy):
                     output_tau=strategy_creator.bounded_output_tau,
                     device=self.device,
                 )
-                initial_weights = copy.deepcopy(model.state_dict())
+                buf = io.BytesIO()
+                torch.save(model.state_dict(), buf)
+                initial_weights = buf
             else:
-                model.load_state_dict(initial_weights)
+                initial_weights.seek(0)
+                model.load_state_dict(torch.load(initial_weights, map_location="cpu", weights_only=True))
 
             all_fold_results.append(
                 self._train_and_evaluate_single_fold(
@@ -162,7 +160,7 @@ class StratifiedSplitTrainingStrategy(BaseTrainingStrategy):
             lr=strategy_creator.learning_rate,
             weight_decay=strategy_creator.weight_decay,
         )
-        scheduler, scheduler_mode = self._create_scheduler(
+        scheduler, _scheduler_mode = self._create_scheduler(
             strategy_creator, optimizer, len(train_loader)
         )
 
@@ -173,7 +171,6 @@ class StratifiedSplitTrainingStrategy(BaseTrainingStrategy):
             val_loader=val_loader,
             optimizer=optimizer,
             scheduler=scheduler,
-            scheduler_mode=scheduler_mode,
             n_epochs=strategy_creator.epochs,
             checkpoint_path=checkpoint_path,
             fold_idx=fold_idx,
@@ -199,6 +196,8 @@ class StratifiedSplitTrainingStrategy(BaseTrainingStrategy):
             unfreeze_epoch=int(strategy_creator.unfreeze_epoch),
             unfreeze_layers=int(strategy_creator.unfreeze_layers),
             unfreeze_lr_factor=float(strategy_creator.unfreeze_lr_factor),
+            swa_start_pct=float(strategy_creator.swa_start_pct),
+            swa_lr=float(strategy_creator.swa_lr),
         )
 
         checkpoint = self._load_best_checkpoint(model, checkpoint_path)
@@ -284,9 +283,10 @@ class StratifiedSplitTrainingStrategy(BaseTrainingStrategy):
         model: nn.Module,
         checkpoint_path: str,
     ) -> dict | None:
-        """Load best-checkpoint weights into model when file exists."""
+        """Load best-checkpoint weights into model; raises if checkpoint is missing."""
         if not os.path.exists(checkpoint_path):
-            return None
+            logging.critical("Checkpoint file not found: %s", checkpoint_path)
+            raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
         checkpoint = torch.load(
             checkpoint_path,
             map_location=self.device,
