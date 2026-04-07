@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from config.constants import PROJECT_ROOT
 from config.defaults import DefaultConfig
 from src.comet.initialize import create_comet_experiment
@@ -74,8 +76,22 @@ class StrategyResolver:
             PROJECT_ROOT / "dataset_creator" / self.evaluation_source / "processed" / "drug_response_features.csv"
         )
 
+    def _validate_config(self) -> None:
+        """Warn about misconfigured options that would have no effect."""
+        if (
+            str(getattr(self, "modality_dropout_schedule", "")) == "warmup_decay"
+            and float(getattr(self, "modality_dropout_drug", 0.0)) == 0.0
+            and float(getattr(self, "modality_dropout_cell", 0.0)) == 0.0
+        ):
+            logging.warning(
+                "modality_dropout_schedule is 'warmup_decay' but both "
+                "modality_dropout_drug and modality_dropout_cell are 0.0 — "
+                "the schedule has no effect."
+            )
+
     def get_split_strategy(self) -> dict:
         """Instantiate and return the dataset and training strategy pair."""
+        self._validate_config()
         split_type = self.split_type
         dataset_path = self.get_dataset_path()
 
@@ -84,6 +100,7 @@ class StrategyResolver:
             hard_validation=self.hard_validation,
             ood_weighting=self.ood_weighting,
             residual_target=self.residual_target,
+            omics_mask=getattr(self, "omics_mask", "1,1,1,1"),
         )
 
         if split_type == "random":

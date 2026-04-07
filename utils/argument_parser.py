@@ -213,6 +213,16 @@ def argument_parser() -> argparse.Namespace:
         help="Final scaling factor for warmup-decay modality dropout schedule",
     )
     advanced_group.add_argument(
+        "--omics_mask",
+        default=defaults.omics_mask,
+        type=str,
+        help=(
+            "Comma-separated binary mask over the 4 omics channels "
+            "(gene_expression, crispr, cnv, methylation). "
+            "E.g. '1,0,0,0' keeps only gene expression. Default: '1,1,1,1'."
+        ),
+    )
+    advanced_group.add_argument(
         "--unfreeze_epoch",
         default=defaults.unfreeze_epoch,
         type=int,
@@ -229,6 +239,13 @@ def argument_parser() -> argparse.Namespace:
         default=defaults.unfreeze_lr_factor,
         type=float,
         help="Learning rate factor applied to base LR after unfreezing (multiplied)",
+    )
+
+    advanced_group.add_argument(
+        "--swa_start_pct",
+        default=defaults.swa_start_pct,
+        type=float,
+        help="Fraction of total epochs after which SWA averaging begins (0.0–1.0, 0 to disable)",
     )
 
     advanced_group.add_argument(
@@ -308,6 +325,18 @@ def _validate_parsed_args(parser: ArgumentParser, args: argparse.Namespace) -> N
             f"got: {args.modality_dropout_final_scale}"
         )
 
+    try:
+        mask_vals = [int(v) for v in args.omics_mask.split(",")]
+        if len(mask_vals) != 4 or not all(v in (0, 1) for v in mask_vals):
+            raise ValueError
+        if sum(mask_vals) == 0:
+            raise ValueError
+    except ValueError:
+        parser.error(
+            "--omics_mask must be 4 comma-separated 0/1 values with at least one 1, "
+            f"got: '{args.omics_mask}'"
+        )
+
     if args.n_splits <= 0:
         parser.error(f"n_splits must be positive, got: {args.n_splits}")
     if args.trainable_encoder_layers < -1:
@@ -322,6 +351,16 @@ def _validate_parsed_args(parser: ArgumentParser, args: argparse.Namespace) -> N
         parser.error("unfreeze_layers must be >= 0")
     if args.unfreeze_lr_factor <= 0:
         parser.error("unfreeze_lr_factor must be > 0")
+
+    if not (0.0 <= args.swa_start_pct <= 1.0):
+        parser.error(f"swa_start_pct must be in [0.0, 1.0], got: {args.swa_start_pct}")
+    if args.swa_lr <= 0:
+        parser.error(f"swa_lr must be positive, got: {args.swa_lr}")
+
+    if args.warm_restarts_t0 < 1:
+        parser.error(f"warm_restarts_t0 must be >= 1, got: {args.warm_restarts_t0}")
+    if args.warm_restarts_t_mult < 1:
+        parser.error(f"warm_restarts_t_mult must be >= 1, got: {args.warm_restarts_t_mult}")
 
     if args.split_type == "cross_domain" and args.evaluation_source is None:
         parser.error("evaluation_source is required when split_type is 'cross_domain'")
