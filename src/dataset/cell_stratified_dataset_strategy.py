@@ -188,7 +188,7 @@ class CellStratifiedDatasetStrategy(BaseDatasetStrategy):
         random_state: Optional[int],
     ) -> Iterator[Tuple[Any, ...]]:
         """Prepare train/val/test loaders for cell-stratified folds."""
-        dataset_df = dataset_dict["dataset"]
+        dataset_df = self._filter_cells_by_active_mask(dataset_dict["dataset"])
 
         global_drug_smiles_lookup, global_cell_features_lookup = (
             self.create_drug_cell_dataset(dataset_df)

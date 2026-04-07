@@ -46,8 +46,7 @@ class DeepResponsePipeline:
 
     def _initialize_comet_logger(self) -> Any:
         """Initialize Comet ML logging strategy."""
-        strategy = self.strategy_creator.get_comet_strategy()
-        logger = strategy.integrate_comet()
+        logger = self.strategy_creator.get_comet_strategy()
         if logger is None and self.strategy_creator.use_comet:
             logging.warning(
                 "Comet requested but unavailable; proceeding without experiment logging."

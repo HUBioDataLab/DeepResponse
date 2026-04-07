@@ -23,6 +23,7 @@ class RandomSplitDatasetStrategy(BaseDatasetStrategy):
         ood_weighting: bool = True,
         residual_target: bool = False,
         n_splits: int = 1,
+        omics_mask: str = "1,1,1,1",
     ) -> None:
         super().__init__(
             data_path=data_path,
@@ -31,6 +32,7 @@ class RandomSplitDatasetStrategy(BaseDatasetStrategy):
             ood_weighting=ood_weighting,
             residual_target=residual_target,
             n_splits=n_splits,
+            omics_mask=omics_mask,
         )
 
     def _resolve_kfold_count(self, n_items: int) -> int:
@@ -246,7 +248,7 @@ class RandomSplitDatasetStrategy(BaseDatasetStrategy):
         random_state: Optional[int],
     ) -> Iterator[Tuple[Any, ...]]:
         """Prepare dataset loaders for random split."""
-        dataset_df = dataset_dict["dataset"]
+        dataset_df = self._filter_cells_by_active_mask(dataset_dict["dataset"])
         base_drug_smiles_lookup, base_cell_features_lookup = (
             self.create_drug_cell_dataset(dataset_df)
         )

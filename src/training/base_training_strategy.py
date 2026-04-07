@@ -8,13 +8,15 @@ import os
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmRestarts
+from torch.optim.swa_utils import AveragedModel, SWALR
 from torch.utils.data import DataLoader
 
 from config.constants import (
@@ -26,9 +28,11 @@ from config.constants import (
     COSINE_ETA_MIN_SCALE,
     DIR_CHECKPOINTS,
     DIR_LOGS,
-    ONECYCLE_FINAL_DIV_FACTOR,
-    ONECYCLE_PCT_START,
+    EARLY_STOP_MIN_DELTA,
+    GRAD_CLIP_NORM,
     SAMPLE_WEIGHT_EPS,
+    WARM_RESTART_T_0,
+    WARM_RESTART_T_MULT,
 )
 from config.defaults import DefaultConfig
 from src.evaluation import compute_metrics
@@ -47,6 +51,7 @@ def pairwise_ranking_loss(
     group_ids: torch.Tensor,
     temperature: float = 1.0,
     margin: float = 1e-6,
+    max_ranking_samples: int = 128,
 ) -> tuple[torch.Tensor, int]:
     """Pairwise ranking loss within the same group."""
     y_true = y_true.reshape(-1)
@@ -55,6 +60,13 @@ def pairwise_ranking_loss(
     n_items = y_true.shape[0]
     if n_items < 2:
         return torch.tensor(0.0, device=y_true.device), 0
+
+    if n_items > max_ranking_samples:
+        idx = torch.randperm(n_items, device=y_true.device)[:max_ranking_samples]
+        y_true = y_true[idx]
+        y_pred = y_pred[idx]
+        group_ids = group_ids[idx]
+        n_items = max_ranking_samples
 
     diff_true = y_true.unsqueeze(1) - y_true.unsqueeze(0)
     diff_pred = y_pred.unsqueeze(1) - y_pred.unsqueeze(0)
@@ -125,15 +137,15 @@ class BestValidationState:
 
 
 class BaseTrainingStrategy(ABC):
-    """Abstract base class for training strategies with shared infrastructure."""
-
-    onecycle_div_factor: float
+    """Abstract base class for training strategies."""
 
     def __init__(self):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.checkpoint_dir = DIR_CHECKPOINTS
         Path(self.checkpoint_dir).mkdir(parents=True, exist_ok=True)
-        self._run_id = f"{time.strftime('%Y%m%d_%H%M%S')}_pid{os.getpid()}"
+        now = datetime.now()
+        self._run_id = f"{now.strftime('%Y%m%d_%H%M%S')}_pid{os.getpid()}"
+        self._log_run_id = f"{now.strftime('%Y-%m-%d_%H-%M-%S')}_pid{os.getpid()}"
         self.prediction_manager = None
 
     @abstractmethod
@@ -306,7 +318,7 @@ class BaseTrainingStrategy(ABC):
         early_stopping: EarlyStopping,
         monitor_metric: str,
     ) -> None:
-        """Log early stopping summary with configured monitor metric."""
+        """Log early stopping event."""
         logging.info(
             "Early stopping at epoch %d (best epoch=%d, best %s=%.4f)",
             epoch,
@@ -338,7 +350,7 @@ class BaseTrainingStrategy(ABC):
         test_metrics: dict,
         train_summary: dict[str, float | str],
     ) -> None:
-        """Attach best-validation fields from train summary into test metrics."""
+        """Attach best-validation fields into test metrics."""
         keys = (
             "best_val_loss",
             "best_val_pcc",
@@ -375,7 +387,7 @@ class BaseTrainingStrategy(ABC):
         model: nn.Module,
         grad_clip_norm: float,
     ) -> bool:
-        """Run backward + optimizer step and report whether params were updated."""
+        """Run backward + optimizer step."""
         if scaler.is_enabled():
             prev_scale = scaler.get_scale()
             scaler.scale(loss).backward()
@@ -430,7 +442,7 @@ class BaseTrainingStrategy(ABC):
 
         drug_encoder = getattr(model, "drug_encoder", None)
         if drug_encoder is None or not hasattr(drug_encoder, "_configure_trainable_layers"):
-            logging.warning("Staged unfreeze requested but model.drug_encoder does not expose _configure_trainable_layers")
+            logging.warning("Staged unfreeze requested but drug_encoder missing _configure_trainable_layers")
             return
 
         try:
@@ -443,7 +455,18 @@ class BaseTrainingStrategy(ABC):
             ]
             if new_params:
                 base_lr = optimizer.param_groups[0]["lr"]
-                optimizer.add_param_group({"params": new_params, "lr": base_lr})
+                new_group = {"params": new_params, "lr": base_lr}
+                for key in (
+                    "initial_lr",
+                    "max_lr",
+                    "min_lr",
+                    "max_momentum",
+                    "base_momentum",
+                    "swa_lr",
+                ):
+                    if key in optimizer.param_groups[0]:
+                        new_group[key] = optimizer.param_groups[0][key]
+                optimizer.add_param_group(new_group)
                 BaseTrainingStrategy._sync_scheduler_lr_lists(scheduler, optimizer)
                 logging.info("Added %d newly unfrozen params to optimizer", len(new_params))
 
@@ -551,7 +574,7 @@ class BaseTrainingStrategy(ABC):
         logging.info("Bounded output configured: mode=%s center=%.4f scale=%.4f tau=%.4f", bounded_output_mode, center, scale, tau)
 
     def _create_optimizer(self, model: nn.Module, lr: float, weight_decay: float) -> optim.Optimizer:
-        """Create AdamW optimizer, skipping frozen params to save VRAM."""
+        """Create AdamW optimizer, skipping frozen params."""
         encoder_params = []
         head_params = []
         for name, param in model.named_parameters():
@@ -570,30 +593,34 @@ class BaseTrainingStrategy(ABC):
 
     def _create_scheduler(self, strategy_creator, optimizer, steps_per_epoch: int):
         """Create learning rate scheduler."""
+        eta_min = max(
+            strategy_creator.learning_rate * COSINE_ETA_MIN_SCALE,
+            COSINE_ETA_MIN_FLOOR,
+        )
+
         if strategy_creator.trainable_encoder_layers == 0:
             logging.info("Scheduler selected: CosineAnnealingLR (epoch-step, stl=0)")
             scheduler = CosineAnnealingLR(
                 optimizer,
-                T_max=strategy_creator.epoch,
-                eta_min=max(
-                    strategy_creator.learning_rate * COSINE_ETA_MIN_SCALE,
-                    COSINE_ETA_MIN_FLOOR,
-                ),
+                T_max=strategy_creator.epochs,
+                eta_min=eta_min,
             )
             return scheduler, "epoch"
 
-        logging.info("Scheduler selected: OneCycleLR (batch-step, stl>0)")
-        total_steps = max(1, strategy_creator.epoch * max(1, steps_per_epoch))
-        scheduler = OneCycleLR(
-            optimizer,
-            max_lr=[group["lr"] for group in optimizer.param_groups],
-            total_steps=total_steps,
-            pct_start=ONECYCLE_PCT_START,
-            anneal_strategy="cos",
-            div_factor=self.onecycle_div_factor,
-            final_div_factor=ONECYCLE_FINAL_DIV_FACTOR,
+        t_0 = int(getattr(strategy_creator, "warm_restarts_t0", WARM_RESTART_T_0))
+        t_mult = int(getattr(strategy_creator, "warm_restarts_t_mult", WARM_RESTART_T_MULT))
+        logging.info(
+            "Scheduler selected: CosineAnnealingWarmRestarts "
+            "(epoch-step, T_0=%d, T_mult=%d, eta_min=%.2e)",
+            t_0, t_mult, eta_min,
         )
-        return scheduler, "batch"
+        scheduler = CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=t_0,
+            T_mult=t_mult,
+            eta_min=eta_min,
+        )
+        return scheduler, "epoch"
 
     def _resolve_drug_embedding(self, batch, model: nn.Module) -> torch.Tensor:
         """Resolve drug embedding from cache or encoder."""
@@ -608,9 +635,36 @@ class BaseTrainingStrategy(ABC):
         drug_emb = self._resolve_drug_embedding(batch, model)
         return model(drug_emb, cell_features)
 
+    @torch.no_grad()
+    def _update_bn_for_swa(
+        self,
+        loader: DataLoader,
+        swa_model: AveragedModel,
+        base_model: nn.Module,
+    ) -> None:
+        """Recompute BatchNorm statistics for the SWA-averaged model."""
+        momenta: dict[nn.Module, float | None] = {}
+        for module in swa_model.modules():
+            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                module.reset_running_stats()
+                momenta[module] = module.momentum
+                module.momentum = None
+
+        if not momenta:
+            return
+
+        swa_model.train()
+        for batch in loader:
+            cell_features = batch["cell_features"].to(self.device)
+            drug_emb = self._resolve_drug_embedding(batch, base_model)
+            swa_model.module(drug_emb, cell_features)
+
+        for module, momentum in momenta.items():
+            module.momentum = momentum
+
     def _batch_targets(self, batch) -> torch.Tensor:
         """Extract response targets from a batch."""
-        return batch["response"].to(self.device).unsqueeze(-1)
+        return batch["response"].to(self.device).reshape(-1, 1)
 
     @staticmethod
     def _tensor_to_numpy(tensor: torch.Tensor) -> np.ndarray:
@@ -715,11 +769,20 @@ class BaseTrainingStrategy(ABC):
         raise ValueError(f"Expected DataLoader, got {type(data)}")
 
     def _run_prefix(self, strategy_creator) -> str:
+        """Prefix used for checkpoint directories."""
         parts = [strategy_creator.data_source]
         if strategy_creator.evaluation_source:
             parts.append(f"to_{strategy_creator.evaluation_source}")
         parts.extend([strategy_creator.split_type, f"stl{strategy_creator.trainable_encoder_layers}"])
         parts.append(self._run_id)
+        return "_".join(parts)
+
+    def _log_prefix(self, strategy_creator) -> str:
+        """Prefix used for result artifacts (matches log filename format)."""
+        parts = [strategy_creator.data_source]
+        if strategy_creator.evaluation_source:
+            parts.append(f"to_{strategy_creator.evaluation_source}")
+        parts.extend([strategy_creator.split_type, self._log_run_id])
         return "_".join(parts)
 
     def _get_run_dir(self, strategy_creator, create: bool = False) -> Path:
@@ -770,7 +833,7 @@ class BaseTrainingStrategy(ABC):
         if len(all_fold_results) == 1:
             payload["test_metrics"] = all_fold_results[0]
 
-        results_path = log_dir / f"{self._run_prefix(strategy_creator)}_results.json"
+        results_path = log_dir / f"{self._log_prefix(strategy_creator)}_results.json"
         with open(results_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, ensure_ascii=True, default=_numpy_to_native)
         logging.info("Saved results artifact: %s", results_path)
@@ -790,3 +853,287 @@ class BaseTrainingStrategy(ABC):
             logging.info("%s: %.4f ± %.4f", key, cv_mean[key], cv_std[key])
             if comet_logger:
                 comet_logger.log_metrics({f"cv_mean_{key}": cv_mean[key], f"cv_std_{key}": cv_std[key]})
+
+    def _run_training_loop(
+        self,
+        *,
+        model: nn.Module,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        optimizer: optim.Optimizer,
+        scheduler,
+        n_epochs: int,
+        checkpoint_path: str,
+        fold_idx: int,
+        comet_logger,
+        use_amp: bool,
+        patience: int,
+        checkpoint_metric: str,
+        bounded_output: str,
+        bounded_output_mode: str,
+        bounded_output_center: float,
+        bounded_output_scale: float,
+        bounded_output_tau: float,
+        bounded_output_std_factor: float,
+        bounded_output_min_scale: float,
+        use_ranking: bool,
+        ranking_weight: float,
+        ranking_group_mode: str,
+        split_type: str,
+        unfreeze_epoch: int,
+        unfreeze_layers: int,
+        unfreeze_lr_factor: float,
+        swa_start_pct: float = 0.0,
+        swa_lr: float = 1e-5,
+    ) -> dict[str, float | str]:
+        """Shared training loop used by all training strategies."""
+        criterion_train = nn.SmoothL1Loss(reduction="none")
+        criterion_eval = nn.SmoothL1Loss()
+        monitor_metric, monitor_mode, early_stopping, best_state = (
+            self._build_checkpoint_policy(
+                checkpoint_metric=checkpoint_metric,
+                patience=patience,
+                min_delta=EARLY_STOP_MIN_DELTA,
+            )
+        )
+        effective_group_mode = self._resolve_ranking_group_mode(
+            split_type=split_type,
+            ranking_group_mode=ranking_group_mode,
+        )
+        logging.info(
+            "Checkpoint/Early-stop policy: monitor=%s mode=%s",
+            monitor_metric,
+            monitor_mode,
+        )
+
+        self._configure_bounded_output(
+            model=model,
+            train_loader=train_loader,
+            bounded_output=bounded_output,
+            bounded_output_mode=bounded_output_mode,
+            bounded_output_center=bounded_output_center,
+            bounded_output_scale=bounded_output_scale,
+            bounded_output_tau=bounded_output_tau,
+            bounded_output_std_factor=bounded_output_std_factor,
+            bounded_output_min_scale=bounded_output_min_scale,
+        )
+
+        if use_ranking:
+            logging.info(
+                "Ranking regularization: ENABLED (weight=%.4f, group_mode=%s, split=%s)",
+                ranking_weight,
+                effective_group_mode,
+                split_type,
+            )
+        else:
+            logging.info(
+                "Ranking regularization: DISABLED (split=%s)",
+                split_type,
+            )
+
+        amp_enabled = bool(use_amp and self.device == "cuda")
+        amp_device = "cuda" if self.device == "cuda" else "cpu"
+        scaler = torch.amp.GradScaler(amp_device, enabled=amp_enabled)
+
+        swa_enabled = 0.0 < swa_start_pct < 1.0
+        swa_start_epoch = int(n_epochs * swa_start_pct) if swa_enabled else n_epochs + 1
+        swa_model: AveragedModel | None = None
+        swa_scheduler: SWALR | None = None
+        swa_n_averaged = 0
+        if swa_enabled:
+            swa_model = AveragedModel(model, device=self.device)
+            swa_scheduler = SWALR(optimizer, swa_lr=swa_lr)
+            try:
+                for group in optimizer.param_groups:
+                    if "swa_lr" not in group:
+                        raise KeyError(
+                            f"Param group missing 'swa_lr' key before training starts. "
+                            f"Group keys: {list(group.keys())}"
+                        )
+            except Exception as exc:
+                raise RuntimeError(f"SWA setup validation failed: {exc}") from exc
+            logging.info(
+                "SWA enabled: averaging begins at epoch %d/%d (pct=%.2f, swa_lr=%.2e)",
+                swa_start_epoch, n_epochs, swa_start_pct, swa_lr,
+            )
+
+        for epoch in range(1, n_epochs + 1):
+            if hasattr(model, "set_training_progress"):
+                model.set_training_progress(epoch=epoch, total_epochs=n_epochs)
+            self._staged_unfreeze(
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch,
+                unfreeze_epoch=unfreeze_epoch,
+                unfreeze_layers=unfreeze_layers,
+                unfreeze_lr_factor=unfreeze_lr_factor,
+            )
+            start_time = time.time()
+            model.train()
+
+            train_loss_total = 0.0
+            huber_total = 0.0
+            rank_total = 0.0
+            n_batches = 0
+            train_preds_list: list[np.ndarray] = []
+            train_targets_list: list[np.ndarray] = []
+
+            for batch in train_loader:
+                targets = self._batch_targets(batch)
+                smiles = batch["smiles"]
+                sample_weight = self._resolve_sample_weight(batch)
+
+                group_ids = self._resolve_group_ids(batch)
+                rank_group_ids = self._resolve_batch_group_ids(
+                    split_type=split_type,
+                    ranking_group_mode=effective_group_mode,
+                    smiles=smiles,
+                    group_ids=group_ids,
+                )
+
+                optimizer.zero_grad(set_to_none=True)
+                with torch.amp.autocast(amp_device, enabled=amp_enabled):
+                    predictions = self._forward_batch(model, batch)
+                    huber_loss = self._compute_weighted_huber(
+                        criterion_train,
+                        predictions,
+                        targets,
+                        sample_weight,
+                    )
+
+                    rank_loss = torch.tensor(0.0, device=self.device)
+                    if use_ranking and rank_group_ids is not None:
+                        rank_loss, _ = pairwise_ranking_loss(
+                            targets.squeeze(-1),
+                            predictions.squeeze(-1),
+                            rank_group_ids,
+                        )
+
+                    loss = huber_loss + (ranking_weight * rank_loss)
+
+                self._optimizer_step(
+                    loss=loss,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    model=model,
+                    grad_clip_norm=GRAD_CLIP_NORM,
+                )
+
+                train_loss_total += float(loss.item())
+                huber_total += float(huber_loss.item())
+                rank_total += float(rank_loss.item())
+                n_batches += 1
+                train_preds_list.append(self._tensor_to_numpy(predictions))
+                train_targets_list.append(self._tensor_to_numpy(targets))
+
+            train_loss = train_loss_total / max(1, n_batches)
+            train_huber = huber_total / max(1, n_batches)
+            train_rank = rank_total / max(1, n_batches)
+
+            train_metrics, train_mse = self._compute_train_epoch_metrics(
+                train_preds_list=train_preds_list,
+                train_targets_list=train_targets_list,
+            )
+
+            val_loss, val_metrics = self._evaluate(model, val_loader, criterion_eval)
+
+            if swa_enabled and epoch >= swa_start_epoch:
+                swa_model.update_parameters(model)
+                for group in optimizer.param_groups:
+                    if "swa_lr" not in group:
+                        group["swa_lr"] = swa_lr
+                swa_scheduler.step()
+                swa_n_averaged += 1
+            else:
+                scheduler.step()
+
+            elapsed = time.time() - start_time
+            current_lr = max(group.get("lr", 0.0) for group in optimizer.param_groups)
+            val_mse = float(val_metrics.get("mse", float("nan")))
+            logging.info(
+                "[Fold %d | Epoch %d/%d] Time: %.1fs | LR: %.2e | "
+                "Train {Loss: %.4f, MSE: %.4f, R2: %.4f, PCC: %.4f} | "
+                "Val {Loss: %.4f, MSE: %.4f, R2: %.4f, PCC: %.4f}",
+                fold_idx,
+                epoch,
+                n_epochs,
+                elapsed,
+                current_lr,
+                train_loss,
+                train_mse,
+                train_metrics["r2"],
+                train_metrics["pcc"],
+                val_loss,
+                val_mse,
+                val_metrics["r2"],
+                val_metrics["pcc"],
+            )
+
+            if comet_logger:
+                prefix = f"fold_{fold_idx}"
+                metrics_payload = {
+                    f"{prefix}/train_loss": train_loss,
+                    f"{prefix}/train_mse": train_mse,
+                    f"{prefix}/train_huber": train_huber,
+                    f"{prefix}/train_r2": train_metrics["r2"],
+                    f"{prefix}/train_pcc": train_metrics["pcc"],
+                    f"{prefix}/val_loss": val_loss,
+                    f"{prefix}/val_mse": val_mse,
+                    f"{prefix}/val_r2": val_metrics["r2"],
+                    f"{prefix}/val_pcc": val_metrics["pcc"],
+                    f"{prefix}/lr": current_lr,
+                }
+                if use_ranking:
+                    metrics_payload[f"{prefix}/train_rank"] = train_rank
+                comet_logger.log_metrics(metrics_payload, epoch=epoch)
+
+            monitor_score, improved = self._update_best_checkpoint(
+                monitor_metric=monitor_metric,
+                monitor_mode=monitor_mode,
+                val_loss=float(val_loss),
+                val_metrics=val_metrics,
+                best_state=best_state,
+                epoch=epoch,
+                model=model,
+                optimizer=optimizer,
+                checkpoint_path=checkpoint_path,
+            )
+            if improved:
+                self._log_best_model_saved(monitor_metric, best_state)
+
+            if early_stopping(monitor_score, epoch):
+                self._log_early_stopping(epoch, early_stopping, monitor_metric)
+                break
+
+        if swa_enabled and swa_model is not None and swa_n_averaged > 0:
+            logging.info(
+                "Finalizing SWA: %d snapshots averaged, updating batch-norm statistics …",
+                swa_n_averaged,
+            )
+            try:
+                self._update_bn_for_swa(train_loader, swa_model, model)
+            except Exception as exc:
+                logging.warning("SWA BN update failed (non-fatal): %s", exc)
+
+            model.load_state_dict(swa_model.module.state_dict())
+            existing_ckpt: dict = {}
+            if os.path.isfile(checkpoint_path):
+                try:
+                    existing_ckpt = torch.load(
+                        checkpoint_path, map_location="cpu", weights_only=True
+                    )
+                except Exception as exc:
+                    logging.warning("Could not load existing checkpoint for SWA re-save: %s", exc)
+            existing_ckpt["model_state_dict"] = model.state_dict()
+            existing_ckpt["swa"] = True
+            torch.save(existing_ckpt, checkpoint_path)
+            logging.info("SWA-averaged weights saved to checkpoint: %s", checkpoint_path)
+        elif swa_enabled and swa_n_averaged == 0:
+            logging.info(
+                "SWA was enabled but training ended before epoch %d; "
+                "best checkpoint kept unchanged.",
+                swa_start_epoch,
+            )
+
+        return self._best_state_to_summary(monitor_metric, best_state)

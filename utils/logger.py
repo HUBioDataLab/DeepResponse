@@ -107,6 +107,7 @@ def log_configuration(args: Namespace) -> None:
             )
             or "None",
             "split_type": getattr(args, "split_type", defaults.split_type),
+            "omics_mask": getattr(args, "omics_mask", defaults.omics_mask),
         },
         "Training": {
             "learning_rate": learning_rate,

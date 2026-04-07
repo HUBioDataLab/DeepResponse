@@ -260,16 +260,77 @@ class RepurposingInferenceEngine:
                 )
         return rows, skipped
 
+    @staticmethod
+    def _adapt_cell_features(
+        cell_features: torch.Tensor,
+        expected_n_genes: int,
+        source_gene_names: list[str] | None = None,
+        target_gene_names: list[str] | None = None,
+    ) -> torch.Tensor:
+        """Align the gene axis of cell_features to the model's expected gene list."""
+        current = cell_features.shape[-1]
+
+        if source_gene_names and target_gene_names:
+            if len(source_gene_names) != current:
+                logger.warning(
+                    "source_gene_names length (%d) != cell_features gene dim (%d); "
+                    "falling back to index-based truncation/padding.",
+                    len(source_gene_names),
+                    current,
+                )
+            else:
+                source_index = {gene: idx for idx, gene in enumerate(source_gene_names)}
+                n_target = len(target_gene_names)
+                output = torch.zeros(
+                    (*cell_features.shape[:-1], n_target),
+                    dtype=cell_features.dtype,
+                    device=cell_features.device,
+                )
+                for tgt_idx, gene in enumerate(target_gene_names):
+                    src_idx = source_index.get(gene)
+                    if src_idx is not None:
+                        output[..., tgt_idx] = cell_features[..., src_idx]
+                return output
+        elif current != expected_n_genes:
+            logger.warning(
+                "Gene name lists not available for cross-domain alignment; "
+                "falling back to index-based truncation/padding (expected=%d, current=%d).",
+                expected_n_genes,
+                current,
+            )
+
+        if current == expected_n_genes:
+            return cell_features
+        if current > expected_n_genes:
+            return cell_features[..., :expected_n_genes]
+        pad_width = expected_n_genes - current
+        return torch.nn.functional.pad(cell_features, (0, pad_width))
+
     @torch.no_grad()
     def _predict_rows(self, model: nn.Module, rows: list[dict]) -> np.ndarray:
         was_training = model.training
         model.eval()
+
+        cell_encoder = getattr(model, "cell_encoder", None)
+        expected_n_genes: int | None = getattr(cell_encoder, "n_genes", None)
+        target_gene_names: list[str] | None = getattr(cell_encoder, "gene_names", None)
+        source_gene_names: list[str] | None = self._shared_axis if self._shared_axis else None
+
         outputs: list[np.ndarray] = []
         for start in range(0, len(rows), self.batch_size):
             batch = rows[start : start + self.batch_size]
             cell_features = torch.stack(
                 [torch.tensor(row["cell_features"], dtype=torch.float32) for row in batch]
             ).to(self.device)
+
+            if expected_n_genes is not None:
+                cell_features = self._adapt_cell_features(
+                    cell_features,
+                    expected_n_genes,
+                    source_gene_names=source_gene_names,
+                    target_gene_names=target_gene_names,
+                )
+
             preds = model.predict_from_smiles([row["smiles"] for row in batch], cell_features)
             outputs.append(preds.detach().cpu().numpy().reshape(-1))
         if was_training:

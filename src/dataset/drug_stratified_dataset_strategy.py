@@ -150,8 +150,6 @@ class DrugStratifiedDatasetStrategy(BaseDatasetStrategy):
                 f"Dataset too small after filtering: {len(filtered_df)} samples"
             )
 
-        # Create disjoint identity splits for proper generalization testing
-        # Each molecular identity appears in only one split (train, val, or test)
         unique_identities = filtered_df["drug_identity"].unique()
         rng = np.random.default_rng(random_state)
         shuffled_identities = rng.permutation(unique_identities)
@@ -313,7 +311,7 @@ class DrugStratifiedDatasetStrategy(BaseDatasetStrategy):
         random_state: Optional[int],
     ) -> Iterator[Tuple[Any, ...]]:
         """Prepare train/val/test loaders for drug-stratified folds."""
-        dataset_df = dataset_dict["dataset"]
+        dataset_df = self._filter_cells_by_active_mask(dataset_dict["dataset"])
 
         global_drug_smiles_lookup, global_cell_features_lookup = (
             self.create_drug_cell_dataset(dataset_df)

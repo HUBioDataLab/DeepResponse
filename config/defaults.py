@@ -22,7 +22,7 @@ class DefaultConfig:
     latent_dim: int = 128
     rank_dim: int = 64
     hidden_dim: int = 1024
-    dropout: float = 0.1
+    dropout: float = 0.15
     force_cell_blind: bool = False
     fusion_type: str = "film_bilinear"
     modality_dropout_drug: float = 0.0
@@ -39,7 +39,7 @@ class DefaultConfig:
 
     batch_size: int = 64
     learning_rate: float = 5e-5
-    weight_decay: float = 1e-3
+    weight_decay: float = 1e-4
     patience: int = 20
     ranking_weight: float = 0.0
     checkpoint_metric: str = "val_loss"
@@ -52,3 +52,11 @@ class DefaultConfig:
     unfreeze_epoch: int = -1
     unfreeze_layers: int = 12
     unfreeze_lr_factor: float = 0.1
+
+    swa_start_pct: float = 0.5
+    swa_lr: float = 1e-5
+
+    omics_mask: str = "1,1,1,1"
+
+    warm_restarts_t0: int = 10
+    warm_restarts_t_mult: int = 2

@@ -101,7 +101,6 @@ class CrossDomainDatasetStrategy(BaseDatasetStrategy):
             [col for col in evaluation_dataset.columns if col in allowed_cols]
         ]
 
-        # Splitting dataset into train, validation, and test
         x_train, x_val, x_test, y_train, y_val, y_test = self.split_dataset(
             dataset, evaluation_dataset, random_state
         )

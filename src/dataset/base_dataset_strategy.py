@@ -1,14 +1,16 @@
 """Base dataset strategy."""
+from __future__ import annotations
+
 import concurrent.futures
 import logging
 import os
 from abc import ABC, abstractmethod
-from typing import Dict, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, default_collate
 
 from config.constants import DEFAULT_NUM_WORKERS, VALIDATION_SPLIT_RATIO
 from rdkit import Chem, DataStructs
@@ -19,30 +21,13 @@ GENE_AXIS_FILENAME = "gene_axis.csv"
 PARALLEL_LOADER_WORKERS = 3
 
 
-def collate_fn(batch):
-    """Custom collate function for drug response data."""
+def collate_fn(batch: list[dict[str, object]]) -> dict[str, object]:
+    """Collate batch with string fields handled separately."""
     smiles = [item["smiles"] for item in batch]
-    cell_features = torch.stack([item["cell_features"] for item in batch])
-    responses = torch.stack([item["response"] for item in batch])
-
-    result = {
-        "smiles": smiles,
-        "cell_features": cell_features,
-        "response": responses,
-    }
-
-    if "sample_weight" in batch[0]:
-        result["sample_weight"] = torch.stack([item["sample_weight"] for item in batch])
-
-    if "group_id" in batch[0]:
-        result["group_id"] = torch.stack([item["group_id"] for item in batch])
-
-    if "drug_embedding" in batch[0]:
-        result["drug_embedding"] = torch.stack(
-            [item["drug_embedding"] for item in batch]
-        )
-
-    return result
+    items_without_smiles = [{k: v for k, v in item.items() if k != "smiles"} for item in batch]
+    collated = default_collate(items_without_smiles)
+    collated["smiles"] = smiles
+    return collated
 
 
 class DrugCellResponseDataset(Dataset):
@@ -58,34 +43,47 @@ class DrugCellResponseDataset(Dataset):
         cached_drug_embeddings: Optional[Dict[str, torch.Tensor]] = None,
     ):
         self.smiles = smiles
-        self.cell_features = cell_features
-        self.targets = targets
-        self.sample_weights = sample_weights
-        self.group_ids = group_ids
+        self.cell_features = torch.as_tensor(
+            np.asarray(cell_features, dtype=np.float32), dtype=torch.float32
+        )
+        self.targets = torch.as_tensor(
+            np.asarray(targets, dtype=np.float32), dtype=torch.float32
+        )
+        self.sample_weights = (
+            torch.as_tensor(
+                np.asarray(sample_weights, dtype=np.float32), dtype=torch.float32
+            )
+            if sample_weights is not None
+            else None
+        )
+        self.group_ids = (
+            torch.as_tensor(
+                np.asarray(group_ids, dtype=np.int64), dtype=torch.long
+            )
+            if group_ids is not None
+            else None
+        )
         self.cached_drug_embeddings = cached_drug_embeddings or {}
 
-    def __len__(self):
-        # Required by Dataset/DataLoader to determine dataset size.
+    def __len__(self) -> int:
         return len(self.targets)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> dict[str, Any]:
         smiles = self.smiles[idx]
         if isinstance(smiles, bytes):
             smiles = smiles.decode("utf-8")
 
         result = {
             "smiles": str(smiles),
-            "cell_features": torch.tensor(self.cell_features[idx], dtype=torch.float32),
-            "response": torch.tensor(self.targets[idx], dtype=torch.float32),
+            "cell_features": self.cell_features[idx],
+            "response": self.targets[idx],
         }
 
         if self.sample_weights is not None:
-            result["sample_weight"] = torch.tensor(
-                self.sample_weights[idx], dtype=torch.float32
-            )
+            result["sample_weight"] = self.sample_weights[idx]
 
         if self.group_ids is not None:
-            result["group_id"] = torch.tensor(self.group_ids[idx], dtype=torch.long)
+            result["group_id"] = self.group_ids[idx]
 
         cached_embedding = self.cached_drug_embeddings.get(str(smiles))
         if cached_embedding is not None:
@@ -110,6 +108,7 @@ class BaseDatasetStrategy(ABC):
         ood_weighting=True,
         residual_target=False,
         n_splits=1,
+        omics_mask: str = "1,1,1,1",
     ):
         """Initialize base dataset strategy state."""
         self.data_path = data_path
@@ -118,12 +117,16 @@ class BaseDatasetStrategy(ABC):
         self.hard_validation = hard_validation
         self.ood_weighting = ood_weighting
         self.residual_target = residual_target
+        self._fingerprint_cache: dict = {}
+        self._kgram_cache: dict = {}
+        mask_vals = [int(v) for v in omics_mask.split(",")]
+        self._omics_mask = np.array(mask_vals, dtype=np.float32).reshape(4, 1)
 
     def _select_model_inputs(self, dataset_df: pd.DataFrame) -> pd.DataFrame:
         """Select model input columns for DataLoader construction."""
         return dataset_df[["drug_name", "cell_line_name"]].copy()
 
-    def _attach_cell_features(self, dataset_df, base_dir):
+    def _attach_cell_features(self, dataset_df: pd.DataFrame, base_dir: str) -> pd.DataFrame:
         features_path = os.path.join(base_dir, CELL_FEATURES_FILENAME)
         features_npz = np.load(features_path, allow_pickle=True)
         features_lookup = {
@@ -138,7 +141,7 @@ class BaseDatasetStrategy(ABC):
         )
         return dataset_df
 
-    def _read_dataset(self, path):
+    def _read_dataset(self, path: str) -> pd.DataFrame:
         dataset_df = pd.read_csv(path)
         if "cell_line_features" not in dataset_df.columns:
             dataset_df = self._attach_cell_features(dataset_df, os.path.dirname(path))
@@ -162,7 +165,7 @@ class BaseDatasetStrategy(ABC):
         logging.info("Dataset loaded with %d samples.", len(dataset_raw))
         return {"dataset": dataset_raw, "evaluation_dataset": None}
 
-    def _load_gene_axis(self, data_path):
+    def _load_gene_axis(self, data_path: str) -> List[str]:
         axis_path = os.path.join(os.path.dirname(data_path), GENE_AXIS_FILENAME)
         if os.path.exists(axis_path):
             gene_df = pd.read_csv(axis_path)
@@ -177,7 +180,10 @@ class BaseDatasetStrategy(ABC):
         return [str(g) for g in features_npz["__gene_axis__"].tolist() if str(g)]
 
     @staticmethod
-    def _map_feature_lookup(cell_features_lookup, transform):
+    def _map_feature_lookup(
+        cell_features_lookup: Union[pd.Series, Dict[str, np.ndarray]],
+        transform: Callable[[np.ndarray], np.ndarray],
+    ) -> Union[pd.Series, Dict[str, np.ndarray]]:
         if hasattr(cell_features_lookup, "apply"):
             return cell_features_lookup.apply(transform)
         if isinstance(cell_features_lookup, dict):
@@ -215,7 +221,7 @@ class BaseDatasetStrategy(ABC):
         return self._map_feature_lookup(cell_features_lookup, transform)
 
     @staticmethod
-    def _normalize_smiles_for_identity(smiles_value):
+    def _normalize_smiles_for_identity(smiles_value: object) -> Optional[str]:
         if pd.isna(smiles_value):
             return None
         text = str(smiles_value).strip()
@@ -232,7 +238,7 @@ class BaseDatasetStrategy(ABC):
                 pass
         return text
 
-    def _get_drug_identity_series(self, dataset_df):
+    def _get_drug_identity_series(self, dataset_df: pd.DataFrame) -> pd.Series:
         drug_name_identity = dataset_df["drug_name"].astype(str)
         if "smiles" not in dataset_df.columns:
             return drug_name_identity
@@ -242,12 +248,12 @@ class BaseDatasetStrategy(ABC):
         )
         return smiles_identity.fillna(drug_name_identity).astype(str)
 
-    def _with_drug_identity(self, dataset_df):
+    def _with_drug_identity(self, dataset_df: pd.DataFrame) -> pd.DataFrame:
         out_df = dataset_df.copy()
         out_df["drug_identity"] = self._get_drug_identity_series(out_df)
         return out_df
 
-    def _pair_group_series(self, dataset_df):
+    def _pair_group_series(self, dataset_df: pd.DataFrame) -> pd.Series:
         with_identity = self._with_drug_identity(dataset_df)
         return (
             with_identity["drug_identity"].astype(str)
@@ -256,7 +262,7 @@ class BaseDatasetStrategy(ABC):
         )
 
     @staticmethod
-    def _smiles_kgram_tokens(smiles, k=3):
+    def _smiles_kgram_tokens(smiles: object, k: int = 3) -> set[str]:
         text = BaseDatasetStrategy._normalize_smiles_for_identity(smiles)
         if text is None:
             return set()
@@ -264,7 +270,7 @@ class BaseDatasetStrategy(ABC):
             return {text}
         return {text[idx : idx + k] for idx in range(len(text) - k + 1)}
 
-    def _build_identity_smiles_lookup(self, dataset_df):
+    def _build_identity_smiles_lookup(self, dataset_df: pd.DataFrame) -> Dict[str, str]:
         if "smiles" not in dataset_df.columns:
             return {}
         with_identity = self._with_drug_identity(dataset_df)
@@ -293,8 +299,11 @@ class BaseDatasetStrategy(ABC):
         )
 
     def _compute_identity_hardness_scores(
-        self, dataset_df, candidate_identities, reference_identities
-    ):
+        self,
+        dataset_df: pd.DataFrame,
+        candidate_identities: List[str],
+        reference_identities: List[str],
+    ) -> Dict[str, float]:
         candidate_ids = [str(identity) for identity in candidate_identities]
         reference_ids = [str(identity) for identity in reference_identities]
         if not candidate_ids:
@@ -310,20 +319,29 @@ class BaseDatasetStrategy(ABC):
         all_ids = sorted(set(candidate_ids) | set(reference_ids))
         fp_lookup = {}
         for identity in all_ids:
+            if identity in self._fingerprint_cache:
+                fp_lookup[identity] = self._fingerprint_cache[identity]
+                continue
             smiles = smiles_lookup.get(identity)
             if not smiles:
                 continue
             mol = Chem.MolFromSmiles(smiles)
             if mol is None:
                 continue
-            fp_lookup[identity] = AllChem.GetMorganFingerprintAsBitVect(
-                mol, radius=2, nBits=2048
-            )
+            fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048)
+            self._fingerprint_cache[identity] = fp
+            fp_lookup[identity] = fp
 
-        token_lookup = {
-            identity: self._smiles_kgram_tokens(smiles_lookup.get(identity), k=3)
-            for identity in all_ids
-        }
+        token_lookup = {}
+        for identity in all_ids:
+            if identity not in self._kgram_cache:
+                self._kgram_cache[identity] = self._smiles_kgram_tokens(
+                    smiles_lookup.get(identity), k=3
+                )
+            token_lookup[identity] = self._kgram_cache[identity]
+
+        ref_fp_ids = [ref_id for ref_id in reference_ids if ref_id in fp_lookup]
+        ref_fps = [fp_lookup[ref_id] for ref_id in ref_fp_ids]
 
         hardness_scores = {}
         for candidate in candidate_ids:
@@ -332,13 +350,14 @@ class BaseDatasetStrategy(ABC):
                 hardness_scores[candidate] = 0.0
                 continue
 
-            similarities = []
+            similarities: list[float] = []
             if candidate in fp_lookup:
                 cand_fp = fp_lookup[candidate]
+                bulk_sims = DataStructs.BulkTanimotoSimilarity(cand_fp, ref_fps)
                 similarities = [
-                    float(DataStructs.TanimotoSimilarity(cand_fp, fp_lookup[ref_id]))
-                    for ref_id in ref_pool
-                    if ref_id in fp_lookup
+                    float(sim)
+                    for ref_id, sim in zip(ref_fp_ids, bulk_sims)
+                    if ref_id != candidate
                 ]
 
             if not similarities:
@@ -366,7 +385,7 @@ class BaseDatasetStrategy(ABC):
         target_val_rows: int,
         rng: np.random.Generator,
     ) -> tuple[set[str], set[str], int, Dict[str, float]]:
-        """Select hard validation identities using similarity-aware ranking."""
+        """Select hard validation identities."""
         normalized_identities = [str(identity) for identity in train_val_identities]
         if len(normalized_identities) < 2:
             raise ValueError(
@@ -417,7 +436,7 @@ class BaseDatasetStrategy(ABC):
         x_val: pd.DataFrame,
         x_test: pd.DataFrame,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Encode cell_line_name values as integer IDs for ranking metadata."""
+        """Encode cell_line_name values as integer IDs."""
         all_cells = pd.Index(dataset_df["cell_line_name"].astype(str).unique())
         cell_to_id = {cell_name: idx for idx, cell_name in enumerate(all_cells)}
 
@@ -431,12 +450,12 @@ class BaseDatasetStrategy(ABC):
 
     def _compute_train_sample_weights(
         self,
-        train_df,
-        rare_alpha=0.5,
-        ood_beta=0.5,
-        clip_min=0.5,
-        clip_max=3.0,
-    ):
+        train_df: pd.DataFrame,
+        rare_alpha: float = 0.5,
+        ood_beta: float = 0.5,
+        clip_min: float = 0.5,
+        clip_max: float = 3.0,
+    ) -> Optional[np.ndarray]:
         if not self.ood_weighting:
             return None
 
@@ -566,8 +585,8 @@ class BaseDatasetStrategy(ABC):
         y_val: pd.DataFrame,
         y_test: pd.DataFrame,
     ) -> None:
-        """Validate target distributions for stable R2 computation."""
-        datasets = [("training", y_train), ("validation", y_val), ("test", y_test)]
+        """Validate target distributions for R2 computation."""
+        datasets = [("Training", y_train), ("Validation", y_val), ("Test", y_test)]
 
         for name, y_data in datasets:
             y_values = y_data["pic50"].values
@@ -581,7 +600,7 @@ class BaseDatasetStrategy(ABC):
             if np.isnan(y_values).any():
                 raise ValueError(f"{name} set contains NaN values")
 
-            logging.info(
+            logging.debug(
                 "%s set: %d samples, mean=%.3f, std=%.3f, range=[%.3f, %.3f]",
                 name,
                 len(y_values),
@@ -591,7 +610,11 @@ class BaseDatasetStrategy(ABC):
                 float(np.max(y_values)),
             )
 
-    def _stack_cell_features(self, cell_features_lookup, cell_line_names=None):
+    def _stack_cell_features(
+        self,
+        cell_features_lookup: Union[pd.Series, Dict[str, np.ndarray]],
+        cell_line_names: Optional[List[str]] = None,
+    ) -> np.ndarray:
         if hasattr(cell_features_lookup, "loc"):
             if cell_line_names is None:
                 selected = cell_features_lookup
@@ -618,13 +641,17 @@ class BaseDatasetStrategy(ABC):
             raise ValueError("No cell line features available for normalization.")
         return np.stack(arrays, axis=0)
 
-    def _compute_cell_feature_stats(self, cell_features_lookup, cell_line_names=None):
+    def _compute_cell_feature_stats(
+        self,
+        cell_features_lookup: Union[pd.Series, Dict[str, np.ndarray]],
+        cell_line_names: Optional[List[str]] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         stacked = self._stack_cell_features(
             cell_features_lookup, cell_line_names
         ).astype(np.float32, copy=False)
 
-        # Warning-free NaN handling: avoid np.nanmean/np.nanstd on all-NaN slices.
-        valid_mask = np.isfinite(stacked)
+        channel_has_data = (stacked != 0.0).any(axis=2, keepdims=True)
+        valid_mask = np.isfinite(stacked) & channel_has_data
         valid_count = valid_mask.sum(axis=0).astype(np.float32)
 
         safe_values = np.where(valid_mask, stacked, 0.0).astype(np.float32, copy=False)
@@ -659,15 +686,23 @@ class BaseDatasetStrategy(ABC):
         std[(valid_count <= 1) | (std < 1e-6)] = 1.0
         return mean, std
 
-    def _apply_cell_feature_transform(self, cell_features_lookup, mean, std):
+    def _apply_cell_feature_transform(
+        self,
+        cell_features_lookup: Union[pd.Series, Dict[str, np.ndarray]],
+        mean: np.ndarray,
+        std: np.ndarray,
+    ) -> Union[pd.Series, Dict[str, np.ndarray]]:
+        mask = self._omics_mask
+
         def transform(arr):
             if not isinstance(arr, np.ndarray):
                 return arr
             filled = np.where(np.isfinite(arr), arr, mean).astype(np.float32)
             scaled = (filled - mean) / std
-            return np.nan_to_num(scaled, nan=0.0, posinf=0.0, neginf=0.0).astype(
+            normalized = np.nan_to_num(scaled, nan=0.0, posinf=0.0, neginf=0.0).astype(
                 np.float32
             )
+            return normalized * mask
 
         return self._map_feature_lookup(cell_features_lookup, transform)
 
@@ -710,7 +745,41 @@ class BaseDatasetStrategy(ABC):
     @abstractmethod
     def prepare_dataset(self, dataset_dict, split_type, batch_size, random_state): ...
 
-    def create_drug_cell_dataset(self, dataset_raw):
+    def _filter_cells_by_active_mask(self, dataset_df: pd.DataFrame) -> pd.DataFrame:
+        """Drop cell lines with no signal in active omics channels for ablation only."""
+        active = [i for i, v in enumerate(self._omics_mask.flatten()) if v > 0]
+        if len(active) == 4:
+            return dataset_df
+
+        def has_signal(arr: np.ndarray) -> bool:
+            if not isinstance(arr, np.ndarray) or arr.ndim != 2:
+                return True
+            return any((arr[ch] != 0).any() for ch in active)
+
+        unique = (
+            dataset_df[["cell_line_name", "cell_line_features"]]
+            .drop_duplicates("cell_line_name")
+        )
+        signal_mask = unique["cell_line_features"].apply(has_signal)
+        valid_cells = set(unique.loc[signal_mask, "cell_line_name"])
+
+        n_cells_before = dataset_df["cell_line_name"].nunique()
+        filtered = dataset_df[dataset_df["cell_line_name"].isin(valid_cells)].reset_index(drop=True)
+        n_removed = n_cells_before - len(valid_cells)
+        if n_removed > 0:
+            logging.info(
+                "Ablation filter (active_channels=%s): removed %d cell lines with no signal "
+                "in active omics (%d -> %d rows).",
+                active,
+                n_removed,
+                len(dataset_df),
+                len(filtered),
+            )
+        return filtered
+
+    def create_drug_cell_dataset(
+        self, dataset_raw: pd.DataFrame
+    ) -> Tuple[pd.Series, pd.Series]:
         drug_smiles_lookup = (
             dataset_raw[["drug_name", "smiles"]]
             .drop_duplicates(subset="drug_name")
@@ -726,17 +795,20 @@ class BaseDatasetStrategy(ABC):
 
     def create_data_loader(
         self,
-        x_data_df,
-        y_data_df,
-        batch_size,
-        cell_features_lookup,
-        drug_smiles_lookup,
-        is_training=True,
-        sample_weights=None,
-        group_ids=None,
-        return_filtered_data=False,
-        original_y_data_df=None,
-        num_workers=DEFAULT_NUM_WORKERS,
+        x_data_df: pd.DataFrame,
+        y_data_df: pd.DataFrame,
+        batch_size: int,
+        cell_features_lookup: Union[pd.Series, Dict[str, np.ndarray]],
+        drug_smiles_lookup: pd.Series,
+        is_training: bool = True,
+        sample_weights: Optional[np.ndarray] = None,
+        group_ids: Optional[np.ndarray] = None,
+        return_filtered_data: bool = False,
+        original_y_data_df: Optional[pd.DataFrame] = None,
+        num_workers: int = DEFAULT_NUM_WORKERS,
+    ) -> (
+        Tuple[Tuple[()], Tuple[int, ...], DataLoader]
+        | Tuple[Tuple[()], Tuple[int, ...], DataLoader, pd.DataFrame, pd.DataFrame]
     ):
         """Create DataLoader from prepared split inputs."""
         logging.info(
@@ -764,7 +836,6 @@ class BaseDatasetStrategy(ABC):
                 arr = arr.reshape(-1, 1)
             return pd.DataFrame(arr)
 
-        # Prepare data using vectorized operations for efficiency
         x_data_df_reset = x_data_df.reset_index(drop=True)
         y_data_df_reset = _reset_as_dataframe(y_data_df, default_col_name="pic50")
         input_rows = len(x_data_df_reset)
@@ -803,9 +874,12 @@ class BaseDatasetStrategy(ABC):
 
         filtered_out = input_rows - len(x_data_filtered)
         if filtered_out > 0:
+            pct = 100.0 * filtered_out / input_rows
             logging.warning(
-                "Skipped %d entries due to missing cell features or drug SMILES.",
+                "DataLoader: dropped %d/%d rows (%.1f%%) — cell/drug not in lookup",
                 filtered_out,
+                input_rows,
+                pct,
             )
         if filtered_out > 0 and not return_filtered_data and not is_training:
             logging.warning(
@@ -828,11 +902,6 @@ class BaseDatasetStrategy(ABC):
         )
         targets = y_data_filtered.to_numpy(dtype=np.float32)
 
-        # Ensure targets have the correct shape
-        if targets.ndim == 1:
-            targets = targets.reshape(-1, 1)
-
-        # Create Dataset
         dataset = DrugCellResponseDataset(
             smiles=drug_smiles,
             cell_features=cell_features,
@@ -841,7 +910,6 @@ class BaseDatasetStrategy(ABC):
             group_ids=group_ids_filtered,
         )
 
-        # Create DataLoader
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
@@ -872,33 +940,41 @@ class BaseDatasetStrategy(ABC):
 
     def _create_parallel_data_loaders(
         self,
-        x_train,
-        y_train,
-        x_val,
-        y_val,
-        x_test,
-        y_test,
-        batch_size,
-        train_cell_features,
-        train_drug_smiles,
-        eval_cell_features,
-        eval_drug_smiles,
-        y_test_actual,
-        train_sample_weights=None,
-        train_group_ids=None,
-        val_group_ids=None,
-        test_group_ids=None,
-        val_cell_features=None,
-        val_drug_smiles=None,
-    ):
+        x_train: pd.DataFrame,
+        y_train: pd.DataFrame,
+        x_val: pd.DataFrame,
+        y_val: pd.DataFrame,
+        x_test: pd.DataFrame,
+        y_test: pd.DataFrame,
+        batch_size: int,
+        train_cell_features: Union[pd.Series, Dict[str, np.ndarray]],
+        train_drug_smiles: pd.Series,
+        eval_cell_features: Union[pd.Series, Dict[str, np.ndarray]],
+        eval_drug_smiles: pd.Series,
+        y_test_actual: pd.DataFrame,
+        train_sample_weights: Optional[np.ndarray] = None,
+        train_group_ids: Optional[np.ndarray] = None,
+        val_group_ids: Optional[np.ndarray] = None,
+        test_group_ids: Optional[np.ndarray] = None,
+        val_cell_features: Optional[Union[pd.Series, Dict[str, np.ndarray]]] = None,
+        val_drug_smiles: Optional[pd.Series] = None,
+    ) -> Tuple[
+        Tuple[Tuple[()], Tuple[int, ...]],
+        DataLoader,
+        DataLoader,
+        DataLoader,
+        pd.DataFrame,
+    ]:
         """Create train/validation/test dataloaders in parallel."""
         val_cell_features = (
             train_cell_features if val_cell_features is None else val_cell_features
         )
         val_drug_smiles = train_drug_smiles if val_drug_smiles is None else val_drug_smiles
 
+        total_samples = len(x_train) + len(x_val) + len(x_test)
+        effective_workers = 1 if total_samples < 5000 else PARALLEL_LOADER_WORKERS
         with concurrent.futures.ThreadPoolExecutor(
-            max_workers=PARALLEL_LOADER_WORKERS
+            max_workers=effective_workers
         ) as executor:
             future_train = executor.submit(
                 self.create_data_loader,

@@ -464,7 +464,6 @@ class DrugCellStratifiedDatasetStrategy(BaseDatasetStrategy):
         if not test_cells_actual.issubset(test_cells):
             raise ValueError("Test set includes cell lines outside held-out cell set.")
 
-        # Pair-level leakage check between train and val.
         train_pairs = set(
             zip(
                 self._get_drug_identity_series(train_df),
@@ -496,9 +495,8 @@ class DrugCellStratifiedDatasetStrategy(BaseDatasetStrategy):
         random_state: Optional[int],
     ) -> Iterator[Tuple[Any, ...]]:
         """Prepare dataset iterator for drug-cell-stratified split(s)."""
-        dataset_df = dataset_dict["dataset"]
+        dataset_df = self._filter_cells_by_active_mask(dataset_dict["dataset"])
 
-        # Create a global lookup from the entire dataset for validation and test sets
         global_drug_smiles_lookup, global_cell_features_lookup = (
             self.create_drug_cell_dataset(dataset_df)
         )
@@ -543,7 +541,6 @@ class DrugCellStratifiedDatasetStrategy(BaseDatasetStrategy):
                 len(train_cell_ids),
             )
 
-            # Create training-specific lookup tables to prevent data leakage
             train_df = dataset_df.loc[x_train.index]
             train_drug_smiles_lookup, train_cell_features_lookup = (
                 self.create_drug_cell_dataset(train_df)

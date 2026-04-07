@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from functools import lru_cache
 
 import selfies as sf
 import torch
@@ -48,6 +49,8 @@ class DrugEncoder(nn.Module):
             nn.LayerNorm(embed_dim),
         )
 
+        self._token_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+
     def _configure_trainable_layers(self, trainable_layers: int):
         """Freeze/unfreeze backbone layers."""
         if trainable_layers == 0:
@@ -72,14 +75,17 @@ class DrugEncoder(nn.Module):
 
     def smiles_to_selfies(self, smiles_list: list[str]) -> list[str]:
         """Convert SMILES to SELFIES."""
-        result = []
-        for smi in smiles_list:
-            try:
-                sel = sf.encoder(smi)
-                result.append(sel if sel is not None else "[C]")
-            except Exception:
-                result.append("[C]")
-        return result
+        return [self._smiles_to_selfies_cached(smi) for smi in smiles_list]
+
+    @staticmethod
+    @lru_cache(maxsize=16384)
+    def _smiles_to_selfies_cached(smi: str) -> str:
+        """Cached single-SMILES to SELFIES conversion."""
+        try:
+            sel = sf.encoder(smi)
+            return sel if sel is not None else "[C]"
+        except Exception:
+            return "[C]"
 
     def tokenize(self, selfies_list: list[str]) -> dict[str, torch.Tensor]:
         """Tokenize SELFIES strings and move to model device."""
@@ -117,9 +123,37 @@ class DrugEncoder(nn.Module):
 
     def encode_smiles(self, smiles_list: list[str]) -> torch.Tensor:
         """Encode SMILES strings into fixed-size embeddings."""
-        selfies = self.smiles_to_selfies(smiles_list)
-        tokens = self.tokenize(selfies)
-        return self.forward(tokens["input_ids"], tokens["attention_mask"])
+        device = next(self.parameters()).device
+        uncached_smiles: list[str] = []
+        uncached_indices: list[int] = []
+        for idx, smi in enumerate(smiles_list):
+            if smi not in self._token_cache:
+                uncached_smiles.append(smi)
+                uncached_indices.append(idx)
+
+        if uncached_smiles:
+            selfies = self.smiles_to_selfies(uncached_smiles)
+            tokens = self.tokenizer(
+                selfies,
+                add_special_tokens=True,
+                max_length=self.max_length,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+            for i, smi in enumerate(uncached_smiles):
+                self._token_cache[smi] = (
+                    tokens["input_ids"][i],
+                    tokens["attention_mask"][i],
+                )
+
+        input_ids = torch.stack(
+            [self._token_cache[smi][0] for smi in smiles_list]
+        ).to(device)
+        attention_mask = torch.stack(
+            [self._token_cache[smi][1] for smi in smiles_list]
+        ).to(device)
+        return self.forward(input_ids, attention_mask)
 
     @torch.no_grad()
     def encode_batch(self, smiles_list: list[str], batch_size: int = 32) -> torch.Tensor:
