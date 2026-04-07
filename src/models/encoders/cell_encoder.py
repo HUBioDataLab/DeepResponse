@@ -65,6 +65,25 @@ class ResidualBlock(nn.Module):
         return F.relu(self.shortcut(x) + self.block(multi_scale))
 
 
+class OmicsChannelGate(nn.Module):
+    """Per-channel scalar attention over omics inputs."""
+
+    def __init__(self, n_channels: int, reduction: int = 4):
+        super().__init__()
+        hidden = max(n_channels * reduction, n_channels)
+        self.gate = nn.Sequential(
+            nn.Linear(n_channels, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, n_channels),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        squeezed = x.mean(dim=2)
+        weights = self.gate(squeezed)
+        return x * weights.unsqueeze(2)
+
+
 class CellLineEncoder(nn.Module):
     """Multi-scale CNN encoder for cell line multi-omics features."""
 
@@ -91,6 +110,8 @@ class CellLineEncoder(nn.Module):
 
         total_channels = branch_channels * 3
 
+        self.channel_gate = OmicsChannelGate(in_channels)
+
         self.branch_small = ConvBranch(in_channels, branch_channels, kernel_size=3)
         self.branch_medium = ConvBranch(in_channels, branch_channels, kernel_size=7)
         self.branch_large = ConvBranch(in_channels, branch_channels, kernel_size=15)
@@ -112,6 +133,8 @@ class CellLineEncoder(nn.Module):
                 f"Expected (batch, {self.in_channels}, {self.n_genes}), "
                 f"got {tuple(x.shape)}"
             )
+
+        x = self.channel_gate(x)
 
         multi_scale = torch.cat(
             [self.branch_small(x), self.branch_medium(x), self.branch_large(x)],
